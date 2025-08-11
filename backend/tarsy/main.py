@@ -8,44 +8,39 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List
 import re
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
 from tarsy.config.settings import get_settings
 from tarsy.controllers.history_controller import router as history_router
 from tarsy.database.init_db import get_database_info, initialize_database
-from tarsy.models.alert import Alert, AlertResponse, ProcessingStatus
+from tarsy.models.alert import Alert, AlertResponse
 from tarsy.models.alert_processing import AlertProcessingData, AlertKey
-from tarsy.models.constants import AlertSessionStatus
 from tarsy.services.alert_service import AlertService
-from tarsy.services.websocket_manager import WebSocketManager
+from tarsy.services.dashboard_connection_manager import DashboardConnectionManager
 from tarsy.utils.logger import get_module_logger, setup_logging
 from tarsy.utils.timestamp import now_us
 
 # Setup logger for this module
 logger = get_module_logger(__name__)
 
-# Global state for processing status tracking
-processing_status: Dict[str, ProcessingStatus] = {}
-
 # Track currently processing alert keys to prevent duplicates
 processing_alert_keys: Dict[str, str] = {}  # alert_key -> alert_id mapping
 alert_keys_lock = asyncio.Lock()  # Protect the processing_alert_keys dict
 
 alert_service: AlertService = None
-websocket_manager: WebSocketManager = None
+dashboard_manager: DashboardConnectionManager = None
 alert_processing_semaphore: asyncio.Semaphore = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global alert_service, websocket_manager, alert_processing_semaphore
+    global alert_service, dashboard_manager, alert_processing_semaphore
     
     # Initialize services
     settings = get_settings()
@@ -75,17 +70,27 @@ async def lifespan(app: FastAPI):
             logger.error(f"Failed to cleanup orphaned sessions during startup: {str(e)}")
     
     alert_service = AlertService(settings)
-    websocket_manager = WebSocketManager()
+    dashboard_manager = DashboardConnectionManager()
     
     # Startup
     await alert_service.initialize()
     
     # Initialize dashboard broadcaster
-    await websocket_manager.initialize_dashboard_broadcaster()
+    await dashboard_manager.initialize_broadcaster()
     
-    # Register integrated hook system (history + dashboard broadcasting)
-    from tarsy.hooks import register_integrated_hooks
-    register_integrated_hooks(websocket_manager)
+    # Initialize typed hook system
+    from tarsy.hooks.hook_registry import get_typed_hook_registry
+    from tarsy.services.history_service import get_history_service
+    typed_hook_registry = get_typed_hook_registry()
+    if settings.history_enabled and db_init_success:
+        history_service = get_history_service()
+        await typed_hook_registry.initialize_hooks(
+            history_service=history_service,
+            dashboard_broadcaster=dashboard_manager.broadcaster
+        )
+        logger.info("Typed hook system initialized successfully")
+    else:
+        logger.info("Typed hook system skipped - history service disabled")
     
     logger.info("Tarsy started successfully!")
     
@@ -102,7 +107,7 @@ async def lifespan(app: FastAPI):
     logger.info("Tarsy shutting down...")
     
     # Shutdown dashboard broadcaster
-    await websocket_manager.shutdown_dashboard_broadcaster()
+    await dashboard_manager.shutdown_broadcaster()
     
     await alert_service.close()
     logger.info("Tarsy shutdown complete")
@@ -322,8 +327,6 @@ async def submit_alert(request: Request):
         if alert_data.runbook and not re.match(r'^https?://', alert_data.runbook):
             logger.warning(f"Suspicious runbook URL format: {alert_data.runbook}")
         
-
-        
         # Apply defaults for missing fields (inline normalization)
         normalized_data = alert_data.data.copy() if alert_data.data else {}
         
@@ -375,20 +378,11 @@ async def submit_alert(request: Request):
             # Generate unique alert ID (only if not duplicate)
             alert_id = str(uuid.uuid4())
             
+            # Register the alert ID as valid
+            alert_service.register_alert_id(alert_id)
+            
             # Register this alert key as being processed
             processing_alert_keys[alert_key_str] = alert_id
-        
-        # Initialize processing status
-        processing_status[alert_id] = ProcessingStatus(
-            alert_id=alert_id,
-            status="queued",
-            progress=0,
-            current_step="Alert received and validated",
-            current_agent=None,
-            assigned_mcp_servers=None,
-            result=None,
-            error=None
-        )
         
         # Start background processing with normalized data
         asyncio.create_task(process_alert_background(alert_id, alert))
@@ -416,56 +410,34 @@ async def submit_alert(request: Request):
             }
         )
 
-
-@app.get("/processing-status/{alert_id}", response_model=ProcessingStatus)
-async def get_processing_status(alert_id: str):
-    """Get processing status for an alert."""
-    if alert_id not in processing_status:
-        raise HTTPException(status_code=404, detail="Alert not found")
+@app.get("/session-id/{alert_id}")
+async def get_session_id(alert_id: str):
+    """Get session ID for an alert.
+    Needed for dashboard websocket subscription because
+    the client which sent the alert request needs to know the session ID (generated later)
+    to subscribe to the alert updates."""
+    # Check if the alert_id exists
+    if not alert_service.alert_exists(alert_id):
+        raise HTTPException(status_code=404, detail=f"Alert ID '{alert_id}' not found")
     
-    return processing_status[alert_id]
-
-
-@app.websocket("/ws/{alert_id}")
-async def websocket_endpoint(websocket: WebSocket, alert_id: str):
-    """WebSocket endpoint for real-time progress updates."""
-    try:
-        await websocket_manager.connect(websocket, alert_id)
-        
-        # Send initial status if available
-        if alert_id in processing_status:
-            await websocket_manager.send_status_update(
-                alert_id, processing_status[alert_id]
-            )
-        
-        # Keep connection alive and handle messages
-        while True:
-            try:
-                # Wait for any message from client (ping/pong or actual data)
-                message = await websocket.receive_text()
-                # Echo back or handle client messages if needed
-                # For now, we just receive and continue
-            except WebSocketDisconnect:
-                break
-                
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        logger.error(f"WebSocket error for alert {alert_id}: {str(e)}")
-    finally:
-        websocket_manager.disconnect(websocket, alert_id)
-
+    session_id = alert_service.get_session_id_for_alert(alert_id)
+    if session_id:
+        return {"alert_id": alert_id, "session_id": session_id}
+    else:
+        # Session might not be created yet or history is disabled
+        return {"alert_id": alert_id, "session_id": None}
 
 @app.websocket("/ws/dashboard/{user_id}")
 async def dashboard_websocket_endpoint(websocket: WebSocket, user_id: str):
     """WebSocket endpoint for dashboard real-time updates."""
     try:
-        await websocket_manager.connect_dashboard(websocket, user_id)
+        logger.info(f"🔌 New WebSocket connection from user: {user_id}")
+        await dashboard_manager.connect(websocket, user_id)
         
         # Send initial connection confirmation
         from tarsy.models.websocket_models import ConnectionEstablished
         connection_msg = ConnectionEstablished(user_id=user_id)
-        await websocket_manager.dashboard_manager.send_to_user(
+        await dashboard_manager.send_to_user(
             user_id, 
             connection_msg.model_dump()
         )
@@ -477,12 +449,12 @@ async def dashboard_websocket_endpoint(websocket: WebSocket, user_id: str):
                 message_text = await websocket.receive_text()
                 try:
                     message = json.loads(message_text)
-                    await websocket_manager.handle_dashboard_message(user_id, message)
+                    await dashboard_manager.handle_subscription_message(user_id, message)
                 except json.JSONDecodeError:
                     # Send error response for invalid JSON
                     from tarsy.models.websocket_models import ErrorMessage
                     error_msg = ErrorMessage(message="Invalid JSON message format")
-                    await websocket_manager.dashboard_manager.send_to_user(
+                    await dashboard_manager.send_to_user(
                         user_id, 
                         error_msg.model_dump()
                     )
@@ -494,7 +466,7 @@ async def dashboard_websocket_endpoint(websocket: WebSocket, user_id: str):
     except Exception as e:
         logger.error(f"Dashboard WebSocket error for user {user_id}: {str(e)}")
     finally:
-        websocket_manager.disconnect_dashboard(user_id)
+        dashboard_manager.disconnect(user_id)
 
 
 async def process_alert_background(alert_id: str, alert: AlertProcessingData):
@@ -514,48 +486,15 @@ async def process_alert_background(alert_id: str, alert: AlertProcessingData):
             if not alert.alert_data or not isinstance(alert.alert_data, dict):
                 raise ValueError("Invalid alert structure: missing or invalid 'alert_data' field")
             
-            # Update status: processing started
-            await update_processing_status(
-                alert_id, "processing", 10, "Starting alert processing and validation"
-            )
-            
             # Log alert processing start
             alert_type = alert.alert_type or "unknown"
             logger.info(f"Processing alert {alert_id} of type '{alert_type}' with {len(alert.alert_data)} data fields")
-            
-            # Process the alert using AlertService with flexible data
-            # The orchestrator sends progress as a dict with agent information
-            def progress_handler(progress, step):
-                try:
-                    # Handle both simple (progress, step) and dict-based callbacks
-                    if isinstance(progress, dict):
-                        # New format from agent callbacks
-                        agent_info = progress
-                        return asyncio.create_task(
-                            update_processing_status(
-                                alert_id,
-                                agent_info.get('status', 'processing'),
-                                agent_info.get('progress', 50),
-                                agent_info.get('message', step),
-                                current_agent=agent_info.get('agent'),
-                                assigned_mcp_servers=agent_info.get('assigned_mcp_servers')
-                            )
-                        )
-                    else:
-                        # Legacy format (progress, step)
-                        return asyncio.create_task(
-                            update_processing_status(alert_id, "processing", progress, step)
-                        )
-                except Exception as e:
-                    logger.error(f"Error in progress_handler for alert {alert_id}: {str(e)}")
-                    # Don't let progress update failures stop processing
-                    return None
             
             # Process with timeout to prevent hanging
             try:
                 # Set a reasonable timeout (e.g., 10 minutes for alert processing)
                 result = await asyncio.wait_for(
-                    alert_service.process_alert(alert, progress_callback=progress_handler),
+                    alert_service.process_alert(alert, api_alert_id=alert_id),
                     timeout=600  # 10 minutes
                 )
             except asyncio.TimeoutError:
@@ -565,50 +504,30 @@ async def process_alert_background(alert_id: str, alert: AlertProcessingData):
             duration = (datetime.now() - start_time).total_seconds()
             logger.info(f"Alert {alert_id} processed successfully in {duration:.2f} seconds")
             
-            # Update status: completed
-            await update_processing_status(
-                alert_id, AlertSessionStatus.COMPLETED, 100, "Processing completed successfully", result
-            )
-            
         except ValueError as e:
             # Configuration or data validation errors
             error_msg = f"Invalid alert data: {str(e)}"
             logger.error(f"Alert {alert_id} validation failed: {error_msg}")
-            await update_processing_status(
-                alert_id, "error", 0, "Validation failed", None, error_msg
-            )
             
         except TimeoutError as e:
             # Processing timeout
             error_msg = str(e)
             logger.error(f"Alert {alert_id} processing timeout: {error_msg}")
-            await update_processing_status(
-                alert_id, "error", 0, "Processing timeout", None, error_msg
-            )
             
         except ConnectionError as e:
             # Network or external service errors
             error_msg = f"Connection error during processing: {str(e)}"
             logger.error(f"Alert {alert_id} connection error: {error_msg}")
-            await update_processing_status(
-                alert_id, "error", 0, "Connection error", None, error_msg
-            )
             
         except json.JSONDecodeError as e:
             # JSON parsing errors in agent processing
             error_msg = f"JSON parsing error in agent processing: {str(e)}"
             logger.error(f"Alert {alert_id} JSON error: {error_msg}")
-            await update_processing_status(
-                alert_id, "error", 0, "Data parsing error", None, error_msg
-            )
             
         except MemoryError as e:
             # Memory issues with large payloads
             error_msg = "Processing failed due to memory constraints (payload too large)"
             logger.error(f"Alert {alert_id} memory error: {error_msg}")
-            await update_processing_status(
-                alert_id, "error", 0, "Memory limit exceeded", None, error_msg
-            )
             
         except Exception as e:
             # Catch-all for unexpected errors
@@ -617,23 +536,6 @@ async def process_alert_background(alert_id: str, alert: AlertProcessingData):
             logger.error(
                 f"Alert {alert_id} unexpected error after {duration:.2f}s: {error_msg}", 
                 exc_info=True
-            )
-            
-            # Try to provide more context about the error
-            error_context = {
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "processing_duration_seconds": duration,
-                "alert_type": alert.alert_type if alert else "unknown"
-            }
-            
-            await update_processing_status(
-                alert_id, 
-                "error", 
-                0, 
-                "Unexpected processing error", 
-                None, 
-                f"Processing failed: {error_msg} | Context: {error_context}"
             )
         
         finally:
@@ -646,36 +548,6 @@ async def process_alert_background(alert_id: str, alert: AlertProcessingData):
                     if alert_key_str in processing_alert_keys:
                         del processing_alert_keys[alert_key_str]
                         logger.debug(f"Cleaned up alert key tracking for {alert_key_str}")
-
-
-async def update_processing_status(
-    alert_id: str, 
-    status: str, 
-    progress: int, 
-    current_step: str,
-    result: str = None,
-    error: str = None,
-    current_agent: str = None,
-    assigned_mcp_servers: List[str] = None
-):
-    """Update processing status and notify WebSocket clients."""
-    processing_status[alert_id] = ProcessingStatus(
-        alert_id=alert_id,
-        status=status,
-        progress=progress,
-        current_step=current_step,
-        current_agent=current_agent,
-        assigned_mcp_servers=assigned_mcp_servers,
-        result=result,
-        error=error
-    )
-    
-    # Send update via WebSocket
-    if websocket_manager:
-        await websocket_manager.send_status_update(
-            alert_id, processing_status[alert_id]
-        )
-
 
 if __name__ == "__main__":
     import uvicorn
