@@ -130,7 +130,6 @@ class AlertService:
             self.agent_factory = AgentFactory(
                 llm_client=self.llm_manager,
                 mcp_client=self.mcp_client,
-                progress_callback=None,  # Will be set per-request
                 mcp_registry=self.mcp_server_registry,
                 agent_configs=self.parsed_config.agents
             )

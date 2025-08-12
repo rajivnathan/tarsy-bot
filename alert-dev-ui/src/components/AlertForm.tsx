@@ -61,15 +61,17 @@ const fieldPresets = [
 const AlertForm: React.FC<AlertFormProps> = ({ onAlertSubmitted }) => {
   // Required fields
   const [alertType, setAlertType] = useState('');
-  const [runbook, setRunbook] = useState('https://github.com/alexeykazakov/runbooks/blob/master/namespace-terminating-v2.md');
+  const [runbook, setRunbook] = useState('https://github.com/rajivnathan/sandbox-sre/blob/testRunbooks/runbooks/vm-suspicious-file.md');
   
   // Dynamic key-value pairs
   const [keyValuePairs, setKeyValuePairs] = useState<KeyValuePair[]>([
     { id: generateId(), key: 'severity', value: 'critical' },
     { id: generateId(), key: 'environment', value: 'production' },
     { id: generateId(), key: 'cluster', value: 'https://api.crc.testing:6443' },
-    { id: generateId(), key: 'namespace', value: 'superman-dev' },
-    { id: generateId(), key: 'message', value: 'Namespace is stuck in terminating state' }
+    { id: generateId(), key: 'namespace', value: 'rajivnathan-dev' },
+    { id: generateId(), key: 'message', value: 'Suspicious files in the /home/fedora directory of the virtual machine' },
+    { id: generateId(), key: 'vm_name', value: 'fedora-white-cow-56' },
+    { id: generateId(), key: 'vm_user', value: 'fedora' }
   ]);
 
   const [availableAlertTypes, setAvailableAlertTypes] = useState<string[]>([]);

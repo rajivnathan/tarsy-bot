@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     
     # Agent Configuration
     agent_config_path: str = Field(
-        default="./config/agents.yaml",
+        default="../config/agents.yaml",
         description="Path to agent and MCP server configuration file"
     )
     
@@ -131,7 +131,7 @@ class Settings(BaseSettings):
                 self.history_database_url = "sqlite:///history.db"
     
     class Config:
-        env_file = ".env"
+        env_file = "/Users/rsenthil/.tarsy/.env"
         env_file_encoding = "utf-8"
         # Allow extra fields to be ignored for backward compatibility
         extra = "ignore"
