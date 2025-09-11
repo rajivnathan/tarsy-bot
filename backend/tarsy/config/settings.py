@@ -146,7 +146,7 @@ class Settings(BaseSettings):
                 self.history_database_url = "sqlite:///history.db"
     
     class Config:
-        env_file = ".env"
+        env_file = "/Users/rsenthil/.tarsy/.env"
         env_file_encoding = "utf-8"
         # Allow extra fields to be ignored for backward compatibility
         extra = "ignore"

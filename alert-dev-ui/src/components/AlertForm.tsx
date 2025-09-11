@@ -62,7 +62,7 @@ const AlertForm: React.FC<AlertFormProps> = ({ onAlertSubmitted }) => {
   // Required fields
   const [alertType, setAlertType] = useState('');
   // const [runbook, setRunbook] = useState('https://github.com/alexeykazakov/runbooks/blob/master/namespace-terminating-v2.md');
-  const [runbook, setRunbook] = useState('https://github.com/alexeykazakov/runbooks/blob/master/pod-crashlooping.md');
+  const [runbook, setRunbook] = useState('https://github.com/rajivnathan/sandbox-sre/blob/testRunbooks/runbooks/vm-suspicious-file.md');
   
   // Dynamic key-value pairs
   const [keyValuePairs, setKeyValuePairs] = useState<KeyValuePair[]>([
@@ -70,9 +70,14 @@ const AlertForm: React.FC<AlertFormProps> = ({ onAlertSubmitted }) => {
     { id: generateId(), key: 'environment', value: 'production' },
     { id: generateId(), key: 'cluster', value: 'https://api.crc.testing:6443' },
     // { id: generateId(), key: 'namespace', value: 'superman-dev' },
-    { id: generateId(), key: 'namespace', value: 'batman-dev' },
+    // { id: generateId(), key: 'namespace', value: 'batman-dev' },
     // { id: generateId(), key: 'message', value: 'Namespace is stuck in terminating state' }
-    { id: generateId(), key: 'message', value: 'Pod is crashlooping' }
+    // { id: generateId(), key: 'message', value: 'Pod is crashlooping' }
+    // { id: generateId(), key: 'cluster', value: 'https://api.a9x7t-qs8zr-ajf.sztj.p3.openshiftapps.com:443' },
+    { id: generateId(), key: 'namespace', value: 'rajivnathan-dev' },
+    { id: generateId(), key: 'message', value: 'Suspicious files in the /home/fedora directory of the virtual machine' },
+    { id: generateId(), key: 'vm_name', value: 'fedora-white-cow-56' },
+    { id: generateId(), key: 'vm_user', value: 'fedora' }
   ]);
 
   const [availableAlertTypes, setAvailableAlertTypes] = useState<string[]>([]);
