@@ -522,7 +522,7 @@ class LLMClient:
                     if self.supports_structured_outputs():
                         logger.info("Using structured output mode")
                         structured_model = self.llm_client.with_structured_output(ReActStructuredResponse, method="json_mode")
-                        structured_model = structured_model.bind(disable_streaming = True)
+                        # structured_model = structured_model.bind(disable_streaming = True)
                         # generation_config = {
                         #     "response_mime_type": "application/json",
                         #     "response_json_schema": ReActStructuredResponse.model_json_schema()
@@ -539,22 +539,22 @@ class LLMClient:
                     llm_with_tools = structured_model
                     code_execution_enabled = False
                     
-                    # if self.config.type == LLMProviderType.GOOGLE:
-                    #     # Collect all enabled native tools (from active config which may be overridden)
-                    #     active_tools = [tool for tool in active_native_tools.values() if tool is not None]
-                    #     # Check if code execution is specifically enabled
-                    #     code_execution_enabled = active_native_tools.get(GoogleNativeTool.CODE_EXECUTION.value) is not None
+                    if self.config.type == LLMProviderType.GOOGLE:
+                        # Collect all enabled native tools (from active config which may be overridden)
+                        active_tools = [tool for tool in active_native_tools.values() if tool is not None]
+                        # Check if code execution is specifically enabled
+                        code_execution_enabled = active_native_tools.get(GoogleNativeTool.CODE_EXECUTION.value) is not None
                         
-                    #     if active_tools:
-                    #         try:
-                    #             # Convert all Google AI SDK tools to dicts and bind to model
-                    #             tools_as_dicts = [t.model_dump(exclude_none=True) for t in active_tools]
-                    #             llm_with_tools = structured_model.bind(tools=tools_as_dicts)
-                    #             tool_names = [k for k, v in active_native_tools.items() if v is not None]
-                    #             logger.info(f"Bound native tools to {self.provider_name} model: {tool_names}")
-                    #         except Exception as e:
-                    #             logger.error(f"Failed to bind native tools: {e}, continuing without tools")
-                    #             llm_with_tools = structured_model
+                        if active_tools:
+                            try:
+                                # Convert all Google AI SDK tools to dicts and bind to model
+                                tools_as_dicts = [t.model_dump(exclude_none=True) for t in active_tools]
+                                llm_with_tools = structured_model.bind(tools=tools_as_dicts)
+                                tool_names = [k for k, v in active_native_tools.items() if v is not None]
+                                logger.info(f"Bound native tools to {self.provider_name} model: {tool_names}")
+                            except Exception as e:
+                                logger.error(f"Failed to bind native tools: {e}, continuing without tools")
+                                llm_with_tools = structured_model
                     
                     logger.info("Finished client request configuration")
 
