@@ -232,7 +232,7 @@ class Settings(BaseSettings):
                 self.database_url = "sqlite:///history.db"
     
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file="/Users/rsenthil/.tarsy/.env",
         env_file_encoding="utf-8",
         # Allow extra fields to be ignored for backward compatibility
         extra="ignore"

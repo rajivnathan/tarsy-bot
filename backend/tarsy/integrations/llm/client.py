@@ -24,7 +24,10 @@ import json
 import pprint
 import traceback
 import urllib3
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from tarsy.agents.parsers.structured_models import ReActStructuredResponse
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -380,6 +383,25 @@ class LLMClient:
             elif msg.role == MessageRole.ASSISTANT:
                 langchain_messages.append(AIMessage(content=msg.content))
         return langchain_messages
+
+    def supports_structured_outputs(self) -> bool:
+        """
+        Check if this client supports structured outputs.
+        
+        Structured outputs are supported for Google/Gemini providers when:
+        1. The provider type is GOOGLE
+        2. use_structured_outputs is enabled in config
+        3. The LLM client is available
+        
+        Returns:
+            True if structured outputs can be used, False otherwise
+        """
+        return (
+            self.available
+            and self.llm_client is not None
+            and self.config.type == LLMProviderType.GOOGLE
+            and self.config.use_structured_outputs
+        )
     
     async def generate_response(
         self,
@@ -388,8 +410,8 @@ class LLMClient:
         stage_execution_id: Optional[str] = None,
         max_tokens: Optional[int] = None,
         interaction_type: Optional[str] = None,
-        max_retries: int = 3,
-        timeout_seconds: int = 120,
+        max_retries: int = 5,
+        timeout_seconds: int = 60,
         mcp_event_id: Optional[str] = None,
         native_tools_override: Optional[NativeToolsConfig] = None
     ) -> LLMConversation:
@@ -427,9 +449,10 @@ class LLMClient:
         if not self.available or not self.llm_client:
             raise Exception(f"{self.provider_name} client not available")
         
+        from tarsy.agents.parsers.structured_models import ReActStructuredResponse, ToolAction
+        
         # Prepare request data for typed context (ensure JSON serializable)
         request_data = {
-            'messages': [msg.model_dump() for msg in conversation.messages],
             'model': self.model,
             'provider': self.provider_name,
             'temperature': self.temperature
@@ -491,51 +514,84 @@ class LLMClient:
                     if max_tokens is not None:
                         config["max_tokens"] = max_tokens
                     
+                    # Prepare generation_config for Google/Gemini (separate from LangChain config)
+                    structured_model = self.llm_client
+
+                    logger.info("Starting output mode detection")
+
+                    if self.supports_structured_outputs():
+                        logger.info("Using structured output mode")
+                        structured_model = self.llm_client.with_structured_output(ReActStructuredResponse, method="json_mode")
+                        structured_model = structured_model.bind(disable_streaming = True)
+                        # generation_config = {
+                        #     "response_mime_type": "application/json",
+                        #     "response_json_schema": ReActStructuredResponse.model_json_schema()
+                        # }
+                    else:
+                        logger.info("Using text output mode")
+                    
+                    logger.info("Finished output mode detection")
+                    
                     # HYBRID APPROACH: Bind native tools to model using Google AI SDK types
                     # Tools are converted to dicts and bound to the model, not passed to astream()
                     # Supports multiple tools: GoogleNativeTool enum (GOOGLE_SEARCH, CODE_EXECUTION, URL_CONTEXT)
                     # Uses active_native_tools which may be overridden at session level
-                    llm_with_tools = self.llm_client
+                    llm_with_tools = structured_model
                     code_execution_enabled = False
                     
-                    if self.config.type == LLMProviderType.GOOGLE:
-                        # Collect all enabled native tools (from active config which may be overridden)
-                        active_tools = [tool for tool in active_native_tools.values() if tool is not None]
-                        # Check if code execution is specifically enabled
-                        code_execution_enabled = active_native_tools.get(GoogleNativeTool.CODE_EXECUTION.value) is not None
+                    # if self.config.type == LLMProviderType.GOOGLE:
+                    #     # Collect all enabled native tools (from active config which may be overridden)
+                    #     active_tools = [tool for tool in active_native_tools.values() if tool is not None]
+                    #     # Check if code execution is specifically enabled
+                    #     code_execution_enabled = active_native_tools.get(GoogleNativeTool.CODE_EXECUTION.value) is not None
                         
-                        if active_tools:
-                            try:
-                                # Convert all Google AI SDK tools to dicts and bind to model
-                                tools_as_dicts = [t.model_dump(exclude_none=True) for t in active_tools]
-                                llm_with_tools = self.llm_client.bind(tools=tools_as_dicts)
-                                tool_names = [k for k, v in active_native_tools.items() if v is not None]
-                                logger.info(f"Bound native tools to {self.provider_name} model: {tool_names}")
-                            except Exception as e:
-                                logger.error(f"Failed to bind native tools: {e}, continuing without tools")
-                                llm_with_tools = self.llm_client
+                    #     if active_tools:
+                    #         try:
+                    #             # Convert all Google AI SDK tools to dicts and bind to model
+                    #             tools_as_dicts = [t.model_dump(exclude_none=True) for t in active_tools]
+                    #             llm_with_tools = structured_model.bind(tools=tools_as_dicts)
+                    #             tool_names = [k for k, v in active_native_tools.items() if v is not None]
+                    #             logger.info(f"Bound native tools to {self.provider_name} model: {tool_names}")
+                    #         except Exception as e:
+                    #             logger.error(f"Failed to bind native tools: {e}, continuing without tools")
+                    #             llm_with_tools = structured_model
                     
+                    logger.info("Finished client request configuration")
+
                     # Aggregate chunks for usage metadata (OpenAI stream_usage=True approach)
                     aggregate_chunk = None
                     
+                    # Track if we're using structured outputs (changes how we handle chunks)
+                    using_structured_outputs = self.supports_structured_outputs()
+                    
                     # Wrap streaming with timeout protection (Python 3.11+)
                     async with asyncio.timeout(timeout_seconds):
+                        
                         async for chunk in llm_with_tools.astream(langchain_messages, config=config):
                             # Aggregate chunks by adding them together
                             # This properly accumulates usage_metadata across all chunks
-                            aggregate_chunk = chunk if aggregate_chunk is None else aggregate_chunk + chunk
+                            # Note: When using structured outputs, chunks are ReActStructuredResponse
+                            # objects which don't support +, so we just keep the latest chunk
+                            # (structured output with disable_streaming=True returns one complete chunk)
+                            if using_structured_outputs:
+                                aggregate_chunk = chunk
+                            else:
+                                aggregate_chunk = chunk if aggregate_chunk is None else aggregate_chunk + chunk
                             
                             # Extract token content, filtering out code execution parts if enabled
                             # This preserves ReAct format by only accumulating text content
-                            token = self._extract_token_content(chunk, filter_code_execution=code_execution_enabled)
+                            # Note: For structured outputs, token extraction happens later via conversion
+                            token = self._extract_token_content(chunk, filter_code_execution=code_execution_enabled) if not using_structured_outputs else ""
                             accumulated_content += token
+                            logger.info(f"chunk received: {chunk}")
+                            logger.info(f"token received: {token}")
                             
                             # Detect start of "Thought:" streaming (disabled during summarization)
                             if (not is_streaming_summarization) and (not is_streaming_thought) and (not is_streaming_final_answer):
                                 if "Thought:" in accumulated_content and "Final Answer:" not in accumulated_content:
                                     is_streaming_thought = True
                                     token_count_since_last_send = 0
-                                    logger.debug(f"Started streaming thought for {session_id}")
+                                    logger.info(f"Started streaming thought for {session_id}")
                             
                             # Check if we should STOP streaming thought
                             if is_streaming_thought and ("Action:" in accumulated_content or "Final Answer:" in accumulated_content):
@@ -688,6 +744,15 @@ class LLMClient:
                                 is_complete=True,
                                 mcp_event_id=mcp_event_id
                             )
+                    
+                    # Convert structured output to ReAct text format if applicable
+                    # When using structured outputs, the aggregate_chunk.content is a 
+                    # ReActStructuredResponse (ToolAction or FinalAnswer) that needs to be
+                    # converted to the text format expected by the ReActParser
+                    if self.supports_structured_outputs() and aggregate_chunk:
+                        content = aggregate_chunk.content if hasattr(aggregate_chunk, 'content') else aggregate_chunk
+                        accumulated_content = self._structured_response_to_react_text(content)
+                        logger.info(f"Converted structured output to ReAct text format (first 500 chars): {accumulated_content[:500]}")
                     
                     # Check for empty response and retry if needed
                     if not accumulated_content or accumulated_content.strip() == "":
@@ -880,6 +945,48 @@ class LLMClient:
         
         # Defensive str() coercion for future-proofing against potential library API shifts
         return str(token) if not isinstance(token, str) else token
+    
+    def _structured_response_to_react_text(self, response: Any) -> str:
+        """
+        Convert a structured output response to ReAct text format.
+        
+        When using structured outputs (e.g., with Gemini's JSON mode), the LLM returns
+        a ReActStructuredResponse object containing either a ToolAction or FinalAnswer.
+        This method converts that structured response back to the text format expected
+        by the ReActParser.
+        
+        Args:
+            response: The structured response object (ReActStructuredResponse, ToolAction, 
+                     FinalAnswer, or already a string)
+        
+        Returns:
+            String in ReAct format:
+            - For ToolAction: "Thought: ...\nAction: ...\nAction Input: ..."
+            - For FinalAnswer: "Thought: ...\nFinal Answer: ..."
+            - For strings: returned as-is
+        """
+        from tarsy.agents.parsers.structured_models import ReActStructuredResponse, ToolAction, FinalAnswer
+        
+        # If already a string, return as-is
+        if isinstance(response, str):
+            return response
+        
+        # Handle ReActStructuredResponse wrapper
+        if isinstance(response, ReActStructuredResponse):
+            response = response.response
+        
+        # Convert ToolAction to ReAct text format
+        if isinstance(response, ToolAction):
+            action_input_str = json.dumps(response.action_input, indent=2) if response.action_input else "{}"
+            return f"Thought: {response.thought}\nAction: {response.action}\nAction Input: {action_input_str}"
+        
+        # Convert FinalAnswer to ReAct text format  
+        if isinstance(response, FinalAnswer):
+            return f"Thought: {response.thought}\nFinal Answer: {response.final_answer}"
+        
+        # Fallback: stringify unknown types
+        logger.warning(f"Unknown structured response type: {type(response)}, falling back to str()")
+        return str(response)
     
     def _store_usage_metadata(
         self, 
@@ -1248,3 +1355,18 @@ class LLMManager:
         default_limit = 150000  # Conservative limit that works for most providers
         logger.info(f"No LLM client available, using default tool result limit: {default_limit:,} tokens")
         return default_limit
+
+    def supports_structured_outputs(self, provider: str = None) -> bool:
+        """
+        Check if the specified or default LLM provider supports structured outputs.
+        
+        Args:
+            provider: Optional provider override (uses default if not specified)
+            
+        Returns:
+            True if the provider supports structured outputs, False otherwise
+        """
+        client = self.get_client(provider)
+        if not client:
+            return False
+        return client.supports_structured_outputs()

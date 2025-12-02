@@ -79,6 +79,12 @@ class LLMProviderConfig(BaseModel):
         description="Native tool configuration for Google/Gemini models (GoogleNativeTool enum values). "
                     "Default: google_search and url_context enabled, code_execution disabled"
     )
+    use_structured_outputs: bool = Field(
+        default=False,
+        description="Enable structured JSON outputs for Gemini models using LangChain's "
+                    ".with_structured_output() method. Reduces parsing errors by enforcing "
+                    "JSON schema at the API level. Currently supported for Google/Gemini only."
+    )
     
     # Runtime fields (added by Settings.get_llm_config())
     api_key: Optional[str] = Field(

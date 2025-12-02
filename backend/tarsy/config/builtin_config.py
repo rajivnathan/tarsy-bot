@@ -243,11 +243,12 @@ BUILTIN_LLM_PROVIDERS: Dict[str, LLMProviderConfig] = {
         model="gemini-2.5-pro",
         api_key_env="GOOGLE_API_KEY",
         native_tools={
-            GoogleNativeTool.GOOGLE_SEARCH.value: True,
+            GoogleNativeTool.GOOGLE_SEARCH.value: False,
             GoogleNativeTool.CODE_EXECUTION.value: False,  # Disabled by default
-            GoogleNativeTool.URL_CONTEXT.value: True,
+            GoogleNativeTool.URL_CONTEXT.value: False,
         },
-        max_tool_result_tokens=950000  # Conservative for 1M context
+        max_tool_result_tokens=950000,  # Conservative for 1M context
+        use_structured_outputs=True  # Enable structured JSON responses (EP-0028)
     ),
     "xai-default": LLMProviderConfig(
         type=LLMProviderType.XAI,
